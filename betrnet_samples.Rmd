@@ -1,0 +1,145 @@
+---
+title: |
+  ![](logo_blk.png){width=5in}  
+  BetrNet samples
+author: "Ceylan Tanes"
+date: \today
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r knitr setup, echo=FALSE, message=FALSE}
+library(knitr)
+opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  dpi=100,
+  fig.width=5,
+  fig.height=3,
+  fig.align = "center"
+  )
+```
+
+
+```{r child = 'betrnet_16S_preamble.Rmd'}
+```
+
+
+```{r}
+## clinical data samples
+
+#withdrawn subjects
+clinical_data %>% filter(grepl("No", FINAL_WITHDRAW)) %>% pull(subject_id)
+
+## 1 control and 7 BE subjects withdrawn
+```
+
+
+```{r}
+## Read in bile acid data to figure out subjects
+subjects_ba <- read_delim(file.path(data_dir, "BETrNET_August2021_bileacids.csv")) %>%
+  select(subject_id=Subject_ID) %>%
+  unique() %>%
+  mutate(BA = TRUE)
+```
+
+```{r}
+## Read in gene analysis data to figure out subjects
+gene_subjects <- read_delim(file.path("/Users/tanesc/Documents/betrnet/betrnet_paper/yun_20231012", "BEvsControl_PCA_rnaseq.csv")) %>%
+  select(SampleID_gene = SampleID) %>%
+  left_join(
+    readxl::read_excel(file.path(data_dir, "10.21 Betrnet RNA extr RIN.xlsx")) %>% filter(!is.na(`Sample ID`)) %>%
+  select(SampleID_gene=Note, subject_id=studyid), by="SampleID_gene"
+  ) %>%
+  select(-SampleID_gene) %>%
+  unique() %>%
+  mutate(genes = TRUE)
+```
+
+```{r}
+## filling in supp table 2
+
+temp <- read_delim(file.path("/Users/tanesc/Documents/betrnet/betrnet_paper/yun_20231012", "BEvsControl_PCA_rnaseq.csv")) %>%
+  select(SampleID_gene = SampleID, Group, kmeans.cluster) %>%
+  left_join(
+    readxl::read_excel(file.path(data_dir, "10.21 Betrnet RNA extr RIN.xlsx")) %>% filter(!is.na(`Sample ID`)) %>%
+  select(SampleID_gene=Note, subject_id=studyid), by="SampleID_gene"
+  ) %>%
+  left_join(clinical_data, by="subject_id") %>%
+  left_join(select(s, subject_id, on_ppi) %>% unique(), by="subject_id") %>%
+  mutate(ASPIRIN = fct_collapse(ASPIRIN, Yes=c("Occasionally", "Daily"))) %>%
+  mutate(HEARTBURN = fct_collapse(HEARTBURN, Yes=c("Yes (current symptoms)", "No (former symptoms, currently medicated)"), No="Never (no history of past or current symptoms)")) 
+
+temp %>% select(kmeans.cluster, on_ppi) %>% table()
+temp %>% select(kmeans.cluster, ASPIRIN) %>% filter(kmeans.cluster %in% c("k-means cluster 2", "k-means cluster 3")) %>% table() %>% fisher.test()
+select(temp, kmeans.cluster, FINAL_HX) %>% filter(kmeans.cluster %in% c("k-means cluster 1", "k-means cluster 2")) %>% table() %>% fisher.test()
+
+
+temp %>%
+  filter(Group == "BE") %>%
+  mutate(hernia = EPINCH - EFOLD) %>%
+  filter(hernia > 0) %>%
+  select(kmeans.cluster, BELENGTHC, BELENGTHM, ENDO_C_VALUE, ENDO_M_VALUE, hernia) %>%
+  pivot_longer(cols=-kmeans.cluster) %>%
+  filter(!is.na(value)) %>%
+  group_by(name, kmeans.cluster) %>%
+  summarize(median = median(value), IQR=IQR(value), quant25=quantile(value)[2], quant75=quantile(value)[4]) %>%
+  ungroup()
+
+```
+
+
+```{r}
+# sequencing samples included in the analysis
+s_toTest2 <- s %>%
+  #filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(sample_type %in% c("Cardia brushing", "Barrett's brushing", "Squamous brushing", "Saliva", "Oral wash")) %>%
+  filter(!SampleID %in% c("B2C019.BR3.BE.No.dys.indef.Endoscopic.brushing", "B2C017OR2.1")) %>% ## take out the duplicate with low read counts
+  droplevels() %>%
+  select(subject_id, sample_type_collapse, study_group_collapse, FINAL_WITHDRAW, Keep) %>%
+  pivot_wider(names_from="sample_type_collapse", values_from="Keep", values_fill = FALSE) %>%
+  full_join(subjects_ba, by="subject_id") %>%
+  full_join(gene_subjects, by="subject_id") %>%
+  
+  filter(!FINAL_WITHDRAW %in% "No (patient completely withdrawn from study)") %>%
+  
+  mutate(study_group_collapse = ifelse(subject_id=="B2M073", "Healthy", as.character(study_group_collapse))) %>%
+  mutate(study_group_collapse = sub("Healthy", "Control", study_group_collapse)) %>%
+  mutate(study_group_collapse = fct_rev(factor(study_group_collapse)))
+  
+  
+```
+
+
+```{r}
+s_toTest2 %>%
+  pivot_longer(-one_of(c("subject_id", "study_group_collapse", "FINAL_WITHDRAW")), names_to="platform", values_to="have_sample") %>%
+  mutate(platform = factor(platform, levels=c("Oral wash", "Saliva", "Squamous brushing", "Barrett's/Cardia brushing", "BA", "genes"))) %>%
+  mutate(platform = fct_recode(platform, `Bile acid`="BA", `Tissue gene expression`="genes")) %>%
+  mutate(have_sample = ifelse(is.na(have_sample), FALSE, have_sample)) %>%
+  #filter(!grepl("No", FINAL_WITHDRAW)) %>%
+  
+  
+  ggplot(aes(x=platform, y=subject_id, fill=have_sample)) +
+    geom_tile(height=0.95, width=0.95) +
+    scale_fill_manual(values=c("gray50", "midnightblue")) +
+    facet_grid(study_group_collapse~., scales="free", space="free") +
+    theme_clean() +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+    ) +
+    guides(fill="none") +
+    labs(
+      x="Sample types",
+      y="Subjects"
+    )
+
+ggsave("betrnet_SuppFig2.pdf", height=17, width=4, useDingbats=F)
+```
+

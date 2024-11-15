@@ -1,0 +1,4414 @@
+---
+title: |
+  ![](logo_blk.png){width=5in}  
+  BetrNet
+author: "Ceylan Tanes"
+date: \today
+header-includes:
+   - \usepackage{float}
+   - \usepackage{pdflscape}
+   - \newcommand{\blandscape}{\begin{landscape}}
+   - \newcommand{\elandscape}{\end{landscape}}
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r knitr setup, echo=FALSE, message=FALSE}
+library(knitr)
+opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  dpi=100,
+  fig.width=5,
+  fig.height=3,
+  fig.align = "center"
+  )
+```
+
+
+```{r child = 'betrnet_16S_preamble.Rmd'}
+```
+
+
+# Are there any site differences?
+
+```{r}
+## Subset the metadata file to only keep the samples you would like to test on
+s_toTest <- s %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(!sample_type %in% c("Oral wash control")) %>%
+  mutate(study_site = fct_rev(factor(study_site))) %>%
+  droplevels()
+
+## Set colors for each factor ahead of time so they are consistent through the report.
+ann_colors = list(
+  sample_type = factor_palette(s_toTest$sample_type, brewer.pal(12, "Paired")),
+  study_site = factor_palette(s_toTest$study_site, as.character(wes_palette("Cavalcanti1"))),
+  study_day = factor_palette(s_toTest$study_day, viridis(length(levels(s_toTest$study_day))) )
+)
+
+## Change this to be the breakdown of whatever variable the collaborator is interested in
+addmargins(table(s_toTest$sample_type, s_toTest$study_site, useNA = "ifany")) %>%
+  pander(split.table=Inf)
+```
+
+
+## Heatmap
+
+```{r}
+prop_cut <- 0.005
+```
+
+Heatmap charts were generated from the taxonomic assignments. Each column represents one sample and each row represents one taxon (typically a genus or family). Ranks are included in the plot if the taxon is present in `r 100*prop_cut`% mean abundance in at least one sample type.
+
+The chart is colored white if species were not observed in the sample, dark blue if species were observed at very low abundance.  This allows the reader to quickly survey species presence/absence.  Abundance values exceeding 40% are colored red, indicating an extremely dominant species.
+
+
+```{r fig.width=60, fig.height=20, eval=F}
+s_toPlot <- s_toTest %>%
+  select(SampleID, sample_type, study_site) %>%
+  arrange(study_site, sample_type) %>%
+  droplevels()
+
+# select taxa with mean relative abundance of 1% in at least one sample type
+select_taxa <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toPlot, by="SampleID")  %>%
+  group_by(sample_type, Taxa) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop = max(mean_prop)) %>%
+  ungroup() %>%
+  filter(mean_prop > prop_cut) %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+props_toPlot <- summed_props[select_taxa, s_toPlot$SampleID]
+
+props_toPlot %>%
+  pheat() %>%
+  pheat_color_saturated() %>%
+  pheat_cluster_rows() %>%
+  pheat_annotate_cols(s_toPlot) %>%
+  pheat_display_cols(gaps = factor_gaps(s_toPlot$sample_type))  %>%
+  pheat_annotation_color(
+    sample_type = ann_colors$sample_type,
+    study_group = ann_colors$study_group
+  ) %>%
+  pheat_save("betrnet_all_samples_heatmap.pdf")
+
+```
+
+
+## Differential abundance
+
+Only the taxa with >1% mean relative abundance across all samples are tested.
+
+```{r}
+props_toTest <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  filter(mean_prop > 0.01) %>%
+  filter(Taxa != "Bacteria") %>%
+  droplevels() %>%
+  
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+write.table(props_toTest, file=file.path(data_dir, "props_toTest_siteDifferences.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+```{r fig.height=15, fig.width=13}
+props_toTest %>%
+  
+  #mutate(Taxa = gsub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  mutate(sample_type = fct_relabel(sample_type, function(x) sub(" ", "\n", x))) %>%
+  
+  ggplot(aes(x=sample_type, y=props, color=study_site)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width=0.75) +
+    scale_color_manual(values=ann_colors$study_site) +
+    facet_wrap(~Taxa, scales="free", ncol=3) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    #scale_y_continuous(labels=scales:::percent) +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x="Sample type", color="Study site",
+      y="Relative abundance")
+```
+
+
+\newpage
+
+
+
+Linear models were used to estimate the change in relative abundance of select taxa between study groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ study_site, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_site", "Penn - ", term)) %>% ### Or whatever the reference level is
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  rename(type="sample_type") %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+  #kable_style()
+
+```
+
+
+
+
+
+## Beta diversity
+
+Here, we use weighted and unweighted UniFrac distances to compare the species composition of the samples to each other.
+
+The plots below show the distance between each pair of samples in a single 2D plot.  It is not possible to plot the distances exactly on paper, so we have used a method of ordination called Principal Coordinates Analysis to select the best coordinate system for display.  The percentage of total variance captured along each axis is displayed on the chart.
+
+```{r}
+s_toTest %>%
+  pcoaplus(wu) %>%
+  plot(color=study_site) +
+    scale_color_manual(values=ann_colors$study_site) +
+    facet_wrap(~sample_type) +
+    theme_clean_pcoa() + 
+    labs(color="", title="Weighted UniFrac")
+```
+
+
+
+```{r}
+s_toTest %>%
+  pcoaplus(uu) %>%
+  plot(color=study_site, shape=sample_type) +
+    scale_color_manual(values=ann_colors$study_site) +
+    facet_wrap(~sample_type) +
+    theme_clean_pcoa() + 
+    labs(color="", title="Unweighted UniFrac")
+```
+
+
+
+PERMANOVA test on weighted and unweighted UniFrac distances to test if the centroids of the study groups can be distinguished from each other.
+
+```{r results = "asis"}
+summaries_df <- rbind(
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonisplus(
+      ., distmat = wu, formula = distmat ~ study_site, sample_id_var = SampleID, permutations=perm)) %>%
+    ungroup() %>%
+    mutate(metric = "Weighted UniFrac"),
+  
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonisplus(
+      ., distmat = uu, formula = distmat ~ study_site, sample_id_var = SampleID, permutations=perm)) %>%
+    ungroup() %>%
+    mutate(metric = "Unweighted UniFrac")
+) %>%
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq"))) %>%
+  select(metric, everything())
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style()
+```
+
+
+
+
+## Alpha diversity
+
+Alpha diversity was assessed by the expected number of observed OTUs (out of rarefying sample size of `r format(richness_subsample_size, big.mark = ",", scientific = F)`), Shannon index, and Faith’s phylogenetic diversity.
+
+```{r fig.width=8, fig.height=6}
+s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  ggplot(aes(x=sample_type, y=alpha, color=study_site)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(dodge.width=0.75) +
+    facet_grid(metric~., scales = "free") +
+    scale_color_manual(values=ann_colors$study_site) +
+    theme_clean() +
+    #guides(color=F) +
+    theme(
+      legend.position="bottom"
+    ) +
+    labs(
+      x="", color="",
+      y="Alpha diversity value"
+    )
+
+```
+
+Linear models were used to estimate the difference between study groups.
+
+```{r results = "asis"}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ study_site, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_site", "Penn - ", term)) ## Change control to whatever the reference group is
+
+
+summaries_df %>%
+  kable_style()
+
+```
+
+
+\newpage
+
+# What is the signature of BE from different sample types?
+
+
+```{r}
+## Subset the metadata file to only keep the samples you would like to test on
+s_toTest <- s %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(sample_type %in% c("Cardia brushing", "Barrett's brushing", "Squamous brushing", "Saliva", "Oral wash")) %>%
+  filter(SampleID != "B2C017OR2.1") %>% ## take out the duplicate with low read counts
+  mutate(sample_type_collapse =  fct_collapse(sample_type, `Cardia and Barretts` = c("Cardia brushing", "Barrett's brushing"))) %>%
+  mutate(sample_type_collapse = fct_recode(sample_type_collapse, `Squamous`="Squamous brushing")) %>%
+  mutate(on_ppi = ifelse(on_ppi, "PPI", "no PPI")) %>%
+  mutate(on_ppi = factor(on_ppi)) %>%
+  mutate(study_group_collapse = fct_rev(study_group_collapse)) %>%
+  droplevels()
+
+## Set colors for each factor ahead of time so they are consistent through the report.
+ann_colors = list(
+  on_ppi = factor_palette(s_toTest$on_ppi, brewer.pal(3, "Set1")),
+  ANTIBIO = factor_palette(s_toTest$ANTIBIO, brewer.pal(3, "Dark2")),
+  study_site = factor_palette(s_toTest$study_site, as.character(wes_palette("Cavalcanti1"))),
+  #study_day = factor_palette(s_toTest$study_day, viridis(length(levels(s_toTest$study_day))) ),
+  study_group_collapse = factor_palette(s_toTest$study_group_collapse, as.character(wes_palette("Royal1")))
+)
+
+## Change this to be the breakdown of whatever variable the collaborator is interested in
+addmargins(table(s_toTest$study_group_collapse, s_toTest$sample_type_collapse, useNA = "ifany")) %>%
+  pander(split.table=Inf)
+```
+
+```{r}
+## ethnicity, aspirin use, smoking, family history, Hiatal hernia size, BE length (C):, BE length (M): 
+# some clinical calculations
+temp <- s_toTest %>%
+  select(subject_id, study_group_collapse, AGE, BMI_RANGE, SEX, ASPIRIN, on_ppi, ETHNICITY, RACE, SMOKEEVER, FAMILY_HX, BELENGTHC, BELENGTHM, ENDO_C_VALUE, ENDO_M_VALUE, EPINCH, EFOLD, ANTIBIO, FINAL_HX, STATINS, HEARTBURN) %>%
+  unique() #pull(subject_id) %>% duplicated() %>% any()
+
+extra_subject <- clinical_data %>% 
+  filter(subject_id == "B2M073") %>% 
+  select(one_of(c(colnames(temp)))) %>%
+  mutate(study_group_collapse = "Healthy") %>%
+  mutate(on_ppi = "PPI")
+  
+temp <- bind_rows(temp, extra_subject) %>%
+  mutate(hiatal_hernia_size = EPINCH - EFOLD) %>%
+  mutate(ASPIRIN = factor(ASPIRIN)) %>%
+  mutate(ASPIRIN = fct_collapse(ASPIRIN, Yes=c("Occasionally", "Daily"))) %>%
+  mutate(RACE = factor(RACE)) %>%
+  mutate(RACE = fct_other(RACE, keep=c("White"))) %>%
+  mutate(ETHNICITY = factor(ETHNICITY)) %>%
+  mutate(ETHNICITY = fct_other(ETHNICITY, keep=c("Non-Hispanic"))) %>%
+  mutate(FAMILY_HX = factor(FAMILY_HX)) %>%
+  mutate(FAMILY_HX = fct_other(FAMILY_HX, keep=c("Yes"))) %>%
+  mutate(HEARTBURN = fct_collapse(HEARTBURN, Yes=c("Yes (current symptoms)", "No (former symptoms, currently medicated)"), No="Never (no history of past or current symptoms)")) 
+
+temp %>%
+  select(study_group_collapse, AGE, BMI_RANGE, BELENGTHC, BELENGTHM) %>%
+  pivot_longer(cols=-study_group_collapse) %>%
+  group_by(study_group_collapse, name) %>%
+  summarize(mean(value, na.rm = T), sd(value, na.rm=T)) %>%
+  ungroup() %>%
+  View()
+
+
+temp %>%
+  select(study_group_collapse, BELENGTHC, BELENGTHM, ENDO_C_VALUE, ENDO_M_VALUE) %>%
+  filter(study_group_collapse == "Barrett's") %>%
+  pivot_longer(cols=-study_group_collapse) %>%
+  filter(!is.na(value)) %>%
+  group_by(name) %>%
+  summarize(median = median(value), IQR=IQR(value), quant25=quantile(value)[2], quant75=quantile(value)[4]) %>%
+  ungroup()
+
+
+temp %>% 
+  select(study_group_collapse, hiatal_hernia_size) %>%
+  filter(!is.na(hiatal_hernia_size)) %>%
+  filter(hiatal_hernia_size >= 0) %>%
+  group_by(study_group_collapse) %>%
+  summarize(median = median(hiatal_hernia_size), IQR=IQR(hiatal_hernia_size), quant25=quantile(hiatal_hernia_size)[2], quant75=quantile(hiatal_hernia_size)[4]) %>%
+  ungroup()
+
+
+
+temp %>%
+  select(study_group_collapse, AGE, BMI_RANGE, hiatal_hernia_size) %>%
+  pivot_longer(cols=-study_group_collapse) %>%
+  group_by(name) %>%
+  do(tidy(wilcox.test(value ~ study_group_collapse, data=.))) %>%
+  ungroup()
+
+
+temp %>%
+  select(-all_of(c("subject_id", "AGE", "BMI_RANGE", "BELENGTHC", "BELENGTHM", "ENDO_C_VALUE", "ENDO_M_VALUE", "hiatal_hernia_size", "EPINCH", "EFOLD")))%>%
+  pivot_longer(cols=-study_group_collapse) %>%
+  group_by(name, value, study_group_collapse) %>%
+  count() %>% 
+  ungroup() %>%
+  
+  group_by(name) %>%
+  complete(value, study_group_collapse) %>%
+  ungroup() %>%
+  
+  filter(!(name %in% c("HEARTBURN") & is.na(value))) %>%
+  mutate(n = ifelse(is.na(n), 0, n)) %>%
+  
+  group_by(name) %>%
+  do(tidy(fisher.test(matrix(.$n, nrow=2))))
+
+```
+
+```{r eval=F}
+s_sra <- s_toTest %>%
+  select(SampleID, subject_id, sample_type=sample_type_collapse, study_group=study_group_collapse, final_library_conc_ng_ul, on_ppi, antibiotics=ANTIBIO, pathology=FINAL_HX, Age=AGE, Sex=SEX, BMI=BMI_RANGE, ENDO_C_VALUE, ENDO_M_VALUE, study_site) %>%
+  mutate(lat_lon = case_when(
+    study_site == "Columbia" ~ "40.943 N 73.837 W",
+    study_site == "Mayo" ~ "44.559 N 92.573 W",
+    study_site == "Penn" ~ "39.956 N 75.193 W"
+  ))
+
+s_sra %>%
+  write.table("betrnet_sra_samples.txt", sep='\t', row.names=F, quote=F)
+
+s_sra %>%
+  select(SampleID) %>%
+  mutate(R1 = paste0(SampleID, "_R1.fastq.gz")) %>%
+  mutate(R2 = paste0(SampleID, "_R2.fastq.gz")) %>%
+  write.table("betrnet_sra_sample_names.txt", sep='\t', row.names=F, quote=F)
+
+
+
+## write sample sheets for demultiplexing
+s_toTest %>%
+  select(SampleID, BarcodeSequence, run) %>%
+  group_by(run) %>%
+  do(write_tsv(., file=paste0("betrnet_", .$run[1], ".txt")))
+```
+
+
+## Heatmap
+
+```{r}
+prop_cut <- 0.005
+```
+
+Heatmap charts were generated from the taxonomic assignments. Each column represents one sample and each row represents one taxon (typically a genus or family). Ranks are included in the plot if the taxon is present in `r 100*prop_cut`% mean abundance in at least one sample type.
+
+The chart is colored white if species were not observed in the sample, dark blue if species were observed at very low abundance.  This allows the reader to quickly survey species presence/absence.  Abundance values exceeding 40% are colored red, indicating an extremely dominant species.
+
+
+```{r fig.width=50, fig.height=10}
+s_toPlot <- s_toTest %>%
+  select(SampleID, sample_type_collapse, on_ppi, study_group_collapse, ANTIBIO) %>%
+  arrange(sample_type_collapse, study_group_collapse, on_ppi, ANTIBIO) %>%
+  droplevels()
+
+# select taxa with mean relative abundance of 1% in at least one sample type
+select_taxa <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toPlot, by="SampleID")  %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop = max(mean_prop)) %>%
+  ungroup() %>%
+  filter(mean_prop > prop_cut) %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+props_toPlot <- summed_props[select_taxa, s_toPlot$SampleID]
+
+props_toPlot %>%
+  pheat() %>%
+  pheat_color_saturated() %>%
+  pheat_cluster_rows() %>%
+  pheat_annotate_cols(s_toPlot) %>%
+  pheat_display_cols(gaps = factor_gaps(s_toPlot$study_group_collapse))  %>%
+  pheat_annotation_color(
+    study_group_collapse = ann_colors$study_group_collapse,
+    on_ppi = ann_colors$on_ppi,
+    ANTIBIO = ann_colors$ANTIBIO
+  )
+
+```
+
+
+## Differential abundance
+
+Only the taxa with >0.5% mean relative abundance across at least one sample type are tested. The threshold is selected to match the bacteria from Kyle's previous analysis.
+
+```{r}
+props_toTest <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  filter(Taxa != "p__Firmicutes g__Sarcina") %>% ## only one sample with high levels of this bacteria
+  droplevels() %>%
+  
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+
+write.table(props_toTest, file=file.path(data_dir, "props_toTest_BEsignature.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+```{r}
+summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type_collapse) %>%
+  summarize(mean_prop = mean(props), perc_presense = mean(props>0)*100) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  filter(Taxa != "p__Firmicutes g__Sarcina") %>% ## only one sample with high levels of this bacteria
+  
+  mutate(mean_prop = mean_prop * 100) %>% 
+  mutate(mean_prop_max = mean_prop_max * 100) %>% 
+  
+  droplevels() %>%
+  
+  write.table(file=file.path(data_dir, "betrnet_taxa_averages.txt"), sep='\t', quote=F, row.names = F)
+```
+
+
+
+
+
+
+
+```{r}
+### Old fig1F
+## Strep vs Prevotella figure
+props_toTest %>%
+  filter(Taxa %in% c("Bacteroidetes Prevotella", "Firmicutes Streptococcus")) %>%
+  select(subject_id, sample_type_collapse, study_group_collapse, Taxa, props) %>%
+  pivot_wider(names_from="Taxa", values_from="props") %>%
+  rename(Prevotella="Bacteroidetes Prevotella", Streptococcus="Firmicutes Streptococcus") %>%
+  
+  ggplot(aes(x=Prevotella, y=Streptococcus, color=study_group_collapse)) +
+    geom_point() +
+    facet_wrap(~sample_type_collapse) +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    theme_clean() +
+    labs(
+      color=""
+    )
+
+props_toTest %>%
+  filter(Taxa %in% c("Bacteroidetes Prevotella", "Firmicutes Streptococcus")) %>%
+  select(subject_id, sample_type_collapse, study_group_collapse, Taxa, props) %>%
+  pivot_wider(names_from="Taxa", values_from="props") %>%
+  rename(Prevotella="Bacteroidetes Prevotella", Streptococcus="Firmicutes Streptococcus") %>%
+  mutate(Strep_Prev = Streptococcus / Prevotella) %>%
+  mutate(sample_type_collapse = fct_relabel(sample_type_collapse, function(x) gsub(" and ", "/\n", x))) %>%
+  ggplot(aes(x=sample_type_collapse, y=Strep_Prev, color=study_group_collapse)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_y_continuous(trans="log10") +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    theme_clean() +
+    labs(
+      x="", color="",
+      y="Streptococcus / Prevotella ratio"
+    )
+#ggsave("betrnet_Fig1F_strep_prevotella.pdf", height=3, width=6, useDingbats=F)
+```
+
+
+```{r fig.height=15, fig.width=14}
+props_toTest %>%
+  
+  mutate(Taxa = gsub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=sample_type_collapse, color=study_group_collapse, y=props, shape=on_ppi)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type_collapse) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + on_ppi + study_group_collapse, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% 
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type_collapse) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+```{r fig.width=10}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(term == "Healthy - Barrett's") %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  filter(Taxa %in% taxa_of_interest) %>%
+  filter(term == "Healthy - Barrett's") %>%
+  mutate(Taxa = reorder(Taxa, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=Taxa, shape=isSig)) +
+    geom_vline(xintercept=0, linetype=2) +
+    geom_point() +
+    geom_linerange(aes(xmin = estimate - std.error, xmax = estimate + std.error)) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nbetween healthy and BE",
+      y="", shape=""
+    )
+
+```
+
+### Fig 1E
+
+```{r fig.width=10}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(sample_type_collapse %in% c("Squamous", "Cardia and Barretts")) %>%
+  filter(term == "Healthy - Barrett's") %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  filter(Taxa %in% taxa_of_interest) %>%
+  filter(sample_type_collapse %in% c("Squamous", "Cardia and Barretts")) %>%
+  filter(term == "Healthy - Barrett's") %>%
+  mutate(Taxa = reorder(Taxa, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=Taxa, shape=isSig)) +
+    geom_vline(xintercept=0, linetype=2) +
+    geom_point() +
+    geom_linerange(aes(xmin = estimate - std.error, xmax = estimate + std.error)) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nbetween healthy and BE",
+      y="", shape=""
+    )
+ggsave("betrnet_Fig1E.pdf", height=2.5, width=6, useDingbats=F)
+```
+
+## Differential abundance: SNV level
+
+```{r}
+props_toTest <- otu_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("SNV") %>% 
+  pivot_longer(-SNV, names_to="SampleID", values_to="props") %>%
+  
+  left_join(rename(a_with_unassigner, SNV=Taxa), by="SNV") %>%
+  filter(grepl("Fusobacterium", tax_assignment)) %>%
+  #rename(Name = y) %>%
+  #mutate(Name = gsub("[pcofgs]__", "", Name)) %>%
+  
+  #mutate(SNV = str_sub(SNV, 1, 10)) %>% ### if the SNV names don't fit in the plot, you can shorten them for plotting
+  #mutate(Taxa = paste(tax_assignment, SNV, sep = ' ')) %>%
+  
+  group_by(SampleID, tax_assignment) %>%
+  summarize(props = sum(props)) %>%
+  ungroup() %>%
+  
+  right_join(select(s_toTest, SampleID, sample_type_collapse, study_group_collapse, ANTIBIO, on_ppi), by="SampleID")  %>%
+  
+  group_by(tax_assignment, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(tax_assignment) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+write.table(props_toTest, file=file.path(data_dir, "Fusobacteirum_props.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+## Differential abundance: Bacterial phenotypes
+
+```{r}
+props_toTest <- props_with_phenotypes %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Phenotype_category, Phenotype, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Phenotype_category, Phenotype) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.01) %>%
+  droplevels() %>%
+  
+  mutate(phenotype = paste(Phenotype_category, Phenotype, sep='\n')) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+
+#write.table(props_toTest, file=file.path(data_dir, "props_toTest_BEsignature.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+```{r fig.height=8, fig.width=14}
+props_toTest %>%
+  
+  ggplot(aes(x=sample_type_collapse, color=study_group_collapse, y=props, shape=on_ppi)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~phenotype, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type_collapse) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + on_ppi + study_group_collapse, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% 
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type_collapse) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+```{r fig.width=10}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(term == "Healthy - Barrett's") %>%
+  pull(phenotype) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  #filter(phenotype %in% taxa_of_interest) %>%
+  filter(term == "Healthy - Barrett's") %>%
+  mutate(phenotype = reorder(phenotype, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=phenotype, shape=isSig)) +
+    geom_vline(xintercept=0, linetype=2) +
+    geom_point() +
+    geom_linerange(aes(xmin = estimate - std.error, xmax = estimate + std.error)) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nbetween healthy and BE",
+      y="", shape=""
+    )
+
+```
+
+
+### Fig1C
+
+```{r}
+props_toTest %>%
+  filter(Phenotype %in% c("Gram-positive", "Gram-negative")) %>%
+  select(subject_id, sample_type_collapse, study_group_collapse, on_ppi, ANTIBIO, Phenotype, props) %>%
+  pivot_wider(names_from="Phenotype", values_from="props") %>%
+  mutate(gram_ratio = `Gram-positive` / `Gram-negative`) %>%
+  mutate(gram_ratio_log = log10(gram_ratio)) %>%
+  
+  group_by(sample_type_collapse) %>%
+  do(tidy(lm(gram_ratio_log ~ on_ppi + ANTIBIO + study_group_collapse, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept|Residuals", term)) %>%
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>% 
+  
+  kable_style()
+  
+```
+
+
+```{r}
+props_toTest %>%
+  filter(Phenotype %in% c("Gram-positive", "Gram-negative")) %>%
+  select(subject_id, sample_type_collapse, study_group_collapse, on_ppi, ANTIBIO, Phenotype, props) %>%
+  pivot_wider(names_from="Phenotype", values_from="props") %>%
+  mutate(gram_ratio = `Gram-positive` / `Gram-negative`) %>%
+  mutate(gram_ratio_log = log10(gram_ratio)) %>%
+  
+  mutate(toTest = interaction(on_ppi, study_group_collapse)) %>%
+  mutate(toTest = fct_rev(toTest)) %>%
+  droplevels() %>% 
+  group_by(sample_type_collapse) %>%
+  do(tidy(lm(gram_ratio_log ~ ANTIBIO + toTest, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept|Residuals", term)) %>%
+  mutate(term = sub("toTest", "PPI.BE - ", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>% View()
+  
+  kable_style()
+  
+```
+
+
+```{r}
+props_toTest %>%
+  filter(study_group_collapse %in% "Healthy") %>%
+  filter(Phenotype %in% c("Gram-positive", "Gram-negative")) %>%
+  select(subject_id, sample_type_collapse, study_group_collapse, on_ppi, ANTIBIO, Phenotype, props) %>%
+  pivot_wider(names_from="Phenotype", values_from="props") %>%
+  mutate(gram_ratio = `Gram-positive` / `Gram-negative`) %>%
+  mutate(gram_ratio_log = log10(gram_ratio)) %>%
+  
+  group_by(sample_type_collapse) %>%
+  do(tidy(lm(gram_ratio_log ~ on_ppi, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept|Residuals", term)) %>%
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>% 
+  
+  kable_style()
+  
+```
+
+```{r}
+props_toTest %>%
+  filter(Phenotype %in% c("Gram-positive", "Gram-negative")) %>%
+  select(subject_id, sample_type_collapse, study_group_collapse, , on_ppi, Phenotype, props) %>%
+  pivot_wider(names_from="Phenotype", values_from="props") %>%
+  mutate(gram_ratio = `Gram-positive` / `Gram-negative`) %>%
+  mutate(sample_type_collapse = fct_relabel(sample_type_collapse, function(x) gsub(" and ", "/\n", x))) %>%
+  ggplot(aes(x=sample_type_collapse, y=gram_ratio, color=study_group_collapse, shape=on_ppi)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_y_continuous(trans="log10") +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(1,16)) +
+    theme_clean() +
+    labs(
+      x="", color="", shape="",
+      y="Gram positive / Gram negative"
+    )
+ggsave("betrnet_Fig1C_gram_staining.pdf", height=2.8, width=5, useDingbats=F)
+```
+
+
+## ASV abundance
+
+```{r}
+props_toTest <- otu_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("SNV") %>% 
+  pivot_longer(-SNV, names_to="SampleID", values_to="props") %>%
+  right_join(select(s_toTest, SampleID, subject_id, study_group_collapse, sample_type_collapse), by="SampleID")  %>%
+  droplevels() %>%
+  
+  group_by(SNV, study_group_collapse, sample_type_collapse) %>%
+  summarize(perc_present = mean(props > 0), sd_props=sd(props), mean_props=mean(props)) %>%
+  ungroup() %>%
+  group_by(SNV) %>%
+  mutate(max_present = max(perc_present)) %>%
+  ungroup() %>%
+  filter(max_present > 0.25) %>%
+  
+  select(-one_of(c("perc_present", "max_present")))
+
+
+props_toTest_ow <- props_toTest %>%
+  filter(sample_type_collapse == "Oral wash") %>%
+  droplevels() %>%
+  select(SNV, ow_sd=sd_props, ow_mean=mean_props, study_group_collapse)
+ 
+
+props_toTest <- props_toTest %>%
+  filter(sample_type_collapse != "Oral wash") %>%
+  left_join(props_toTest_ow, by=c("SNV", "study_group_collapse")) 
+
+props_toTest %>%
+  ggplot(aes(x=ow_mean, y=mean_props,color=sample_type_collapse)) +
+    geom_abline(slope=1, intercept=0, linetype=2) +
+    geom_errorbar(aes(xmin=ow_mean-ow_sd, xmax=ow_mean+ow_sd)) +
+    geom_errorbar(aes(ymin=ow_mean-ow_sd, ymax=ow_mean+ow_sd)) +
+    #scale_x_continuous(trans="log10") +
+    #scale_y_continuous(trans="log10") +
+    coord_equal() +
+    theme_clean() +
+    facet_grid(study_group_collapse~sample_type_collapse)
+```
+
+
+
+
+
+## Beta diversity
+
+Here, we use weighted and unweighted UniFrac distances to compare the species composition of the samples to each other.
+
+The plots below show the distance between each pair of samples in a single 2D plot.  It is not possible to plot the distances exactly on paper, so we have used a method of ordination called Principal Coordinates Analysis to select the best coordinate system for display.  The percentage of total variance captured along each axis is displayed on the chart.
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(wu) %>%
+  plot(color=study_group_collapse, shape=on_ppi) +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="", title="Weighted UniFrac")
+```
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(uu) %>%
+  plot(color=study_group_collapse, shape=on_ppi) +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="", title="Unweighted UniFrac")
+```
+
+
+
+PERMANOVA test on weighted and unweighted UniFrac distances to test if the centroids of the study groups can be distinguished from each other.
+
+```{r}
+summaries_df <- rbind(
+  s_toTest %>%
+    group_by(sample_type_collapse) %>%
+    do(adonisplus(
+      ., distmat = wu, formula = distmat ~ ANTIBIO + on_ppi + study_group_collapse,
+      sample_id_var = SampleID, permutations=999)) %>%
+    ungroup() %>%
+    mutate(metric = "Weighted UniFrac"),
+  
+  s_toTest %>%
+    group_by(sample_type_collapse) %>%
+    do(adonisplus(
+      ., distmat = uu, formula = distmat ~ ANTIBIO + on_ppi + study_group_collapse,
+      sample_id_var = SampleID, permutations=perm)) %>%
+    ungroup() %>%
+  mutate(metric = "Unweighted UniFrac")
+) %>%
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq"))) %>%
+  select(metric, everything())
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style()
+```
+
+
+
+```{r}
+summaries_df <-s_toTest %>%
+  mutate(toTest = interaction(on_ppi, study_group_collapse)) %>%
+  group_by(sample_type_collapse) %>%
+  do(adonispost(
+    ., distmat = wu, formula = distmat ~ ANTIBIO + toTest,
+    sample_id_var = SampleID, permutations=999, which = toTest, alpha = 1)) %>%
+  ungroup() %>%
+
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq")))
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style()
+```
+
+
+
+### Fig 1D
+
+```{r fig.width=10}
+pcoa_toPlot <- s_toTest %>%
+  filter(sample_type_collapse %in% c("Squamous", "Cardia and Barretts")) %>%
+  droplevels() %>%
+  pcoaplus(wu) 
+
+centroids <- pcoa_toPlot %>%
+  group_by(study_group_collapse, sample_type_collapse) %>%
+  mutate(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)) %>%
+  ungroup() 
+
+
+pcoa_toPlot %>%
+  plot(color=study_group_collapse, shape=on_ppi) +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(1,16)) +
+    geom_point(data=centroids, aes(x=Axis.1, y=Axis.2, color=study_group_collapse), shape=8, stroke=1, size=2) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="")
+ggsave("betrnet_Fig1D.pdf", height=3, width=6, useDingbats=F)
+```
+
+### Fig 1A
+
+```{r fig.width=10}
+pcoa_toPlot <- s_toTest %>%
+  filter(sample_type_collapse %in% c("Saliva", "Oral wash")) %>%
+  droplevels() %>%
+  pcoaplus(wu) 
+
+centroids <- pcoa_toPlot %>%
+  group_by(study_group_collapse, sample_type_collapse) %>%
+  mutate(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)) %>%
+  ungroup() 
+
+
+pcoa_toPlot %>%
+  plot(color=study_group_collapse, shape=on_ppi) +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(1,16)) +
+    geom_point(data=centroids, aes(x=Axis.1, y=Axis.2, color=study_group_collapse), shape=8, stroke=1, size=2) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="")
+ggsave("betrnet_Fig1A.pdf", height=3, width=6, useDingbats=F)
+```
+
+```{r}
+pairwise_dists <- as.matrix(wu) %>%
+  as_tibble(rownames="SampleID.x") %>%
+  pivot_longer(names_to="SampleID.y", values_to="distance", -SampleID.x) %>%
+  filter(SampleID.x != SampleID.y) %>%
+  left_join(select(s_toTest, SampleID.x=SampleID, subject_id, study_group_collapse, sample_type_collapse, on_ppi, ANTIBIO), by="SampleID.x") %>%
+  left_join(select(s_toTest, SampleID.y=SampleID, subject_id, study_group_collapse, sample_type_collapse), by="SampleID.y") %>%
+  filter(subject_id.x == subject_id.y) %>%
+  filter(sample_type_collapse.x %in% c("Saliva", "Oral wash")) %>%
+  filter(sample_type_collapse.x != sample_type_collapse.y) 
+
+```
+
+distance ~ ANTIBIO + on_ppi + study_group_collapse
+
+```{r}
+pairwise_dists %>%
+  group_by(sample_type_collapse.x,sample_type_collapse.y) %>%
+  do(tidy(lm(distance ~ ANTIBIO + on_ppi + study_group_collapse.x, data=.))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>% 
+  kable_style()
+
+```
+
+```{r}
+pairwise_dists %>%
+  mutate(toTest = interaction(on_ppi, study_group_collapse.x)) %>%
+  mutate(toTest = fct_rev(toTest)) %>%
+  droplevels() %>% 
+  group_by(sample_type_collapse.x,sample_type_collapse.y) %>%
+  do(tidy(lm(distance ~ ANTIBIO + toTest, data=.))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("toTest", "PPI.BE - ", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>% View()
+  kable_style()
+
+```
+
+
+distance ~ study_group_collapse
+
+```{r}
+pairwise_dists %>%
+  group_by(sample_type_collapse.x,sample_type_collapse.y) %>%
+  do(tidy(lm(distance ~ study_group_collapse.x, data=.))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>% 
+  kable_style()
+
+```
+
+
+Only for subjects on PPI: distance ~ ANTIBIO + study_group_collapse
+
+```{r}
+pairwise_dists %>%
+  filter(on_ppi == "PPI") %>%
+  group_by(sample_type_collapse.x,sample_type_collapse.y) %>%
+  do(tidy(lm(distance ~ ANTIBIO + study_group_collapse.x, data=.))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>% 
+  kable_style()
+
+```
+
+### Fig 1B
+
+```{r}
+pairwise_dists %>%
+  filter(sample_type_collapse.x == "Oral wash") %>%
+  mutate(sample_type_collapse.y = fct_relabel(sample_type_collapse.y, function(x) gsub(" and ", "/\n", x))) %>%
+  ggplot(aes(x=sample_type_collapse.y, y=distance, color=study_group_collapse.x, shape=on_ppi)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    #facet_wrap(~sample_type_collapse.x, scales="free_x") +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(1,16)) +
+    theme_clean() +
+    theme(
+      aspect.ratio = 1
+    ) +
+    labs(
+      x="", color="", shape="",
+      y="Distance to\noral wash samples"
+    )
+ggsave("betrnet_Fig1B.pdf", height=2.8, width=5, useDingbats=F)
+```
+
+
+
+## Alpha diversity
+
+Alpha diversity was assessed by the expected number of observed OTUs (out of rarefying sample size of `r format(richness_subsample_size, big.mark = ",", scientific = F)`), Shannon index, and Faith’s phylogenetic diversity.
+
+```{r fig.width=8}
+s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  ggplot(aes(x=sample_type_collapse, color=study_group_collapse, y=alpha, shape=on_ppi)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(dodge.width=0.75) +
+    facet_grid(metric~., scales = "free") +
+    scale_color_manual(values=ann_colors$study_group_collapse) +
+    scale_shape_manual(values=c(16,1)) +
+    theme_clean() +
+    #guides(color=F) +
+    labs(
+      x="", color="",
+      y="Alpha diversity value"
+    )
+
+```
+
+Linear models were used to estimate the difference between study groups.
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type_collapse) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + on_ppi + study_group_collapse, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% ## Change control to whatever the reference group is
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  mutate(term = sub("on_ppiPPI", "PPI use", term))
+
+summaries_df %>%
+  kable_style()
+
+```
+
+
+
+# BE samples only
+
+The samples that don't have any pathology information. The subjects are `r clinical_data %>% filter(is.na(FINAL_HX)) %>% pull(subject_id) %>% str_c(collapse=", ")`
+
+```{r}
+## Subset the metadata file to only keep the samples you would like to test on
+s_toTest <- s %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(study_group_collapse %in% "Barrett's") %>%
+  filter(sample_type %in% c("Barrett's brushing", "Squamous brushing", "Saliva", "Oral wash")) %>%
+  mutate(sample_type = fct_relabel(sample_type, function(x) sub(" brushing", "", x))) %>%
+  
+  filter(!is.na(FINAL_HX)) %>%
+  
+  mutate(on_ppi = ifelse(on_ppi, "PPI", "no PPI")) %>%
+  mutate(on_ppi = factor(on_ppi)) %>%
+  
+  mutate(FINAL_HX = factor(FINAL_HX, levels=c("Intestinal metaplasia, no dysplasia", "Indefinite for dysplasia", "Low grade dysplasia", "High grade dysplasia", "Adenocarcinoma"))) %>%
+  
+  mutate(FINAL_HX_shorthand = fct_recode(FINAL_HX, NDBE="Intestinal metaplasia, no dysplasia", IND="Indefinite for dysplasia", LGD="Low grade dysplasia", HGD="High grade dysplasia", EAC="Adenocarcinoma")) %>%
+  
+  mutate(pathology_linear = factor(FINAL_HX, ordered=T)) %>%
+  
+  mutate(pathology2 = fct_collapse(FINAL_HX, `No dysplasia`=c("Intestinal metaplasia, no dysplasia"), Intermediate=c("Indefinite for dysplasia", "Low grade dysplasia"), Advanced=c("High grade dysplasia", "Adenocarcinoma"))) %>%
+  mutate(pathology2_linear = factor(pathology2, ordered=T)) %>%
+  
+  mutate(FINAL_HX_consec = FINAL_HX) %>%
+  mutate(pathology2_consec = pathology2) %>%
+  
+  select(-FINAL_PATH) %>% ## just to make sure I'm not accidentally calling FINAL_PATH from legacy code
+  
+  droplevels()
+
+## Set colors for each factor ahead of time so they are consistent through the report.
+ann_colors = list(
+  on_ppi = factor_palette(s_toTest$on_ppi, brewer.pal(3, "Set1")),
+  ANTIBIO = factor_palette(s_toTest$ANTIBIO, brewer.pal(3, "Dark2")),
+  study_site = factor_palette(s_toTest$study_site, as.character(wes_palette("Cavalcanti1"))),
+  #study_day = factor_palette(s_toTest$study_day, viridis(length(levels(s_toTest$study_day))) ),
+  study_group_collapse = factor_palette(s_toTest$study_group_collapse, as.character(wes_palette("Royal1"))),
+  FINAL_HX_shorthand = factor_palette(s_toTest$FINAL_HX_shorthand, viridis(length(levels(s_toTest$FINAL_HX_shorthand)), end=0.8) ),
+  FINAL_HX = factor_palette(s_toTest$FINAL_HX, viridis(length(levels(s_toTest$FINAL_HX)), end=0.8) ),
+  pathology2 = factor_palette(s_toTest$pathology2, viridis(length(levels(s_toTest$pathology2)), end=0.8) )
+)
+
+contrasts(s_toTest$FINAL_HX_consec) <- matrix(c(-4/5, 1/5, 1/5, 1/5, 1/5, -3/5, -3/5, 2/5, 2/5, 2/5, -2/5, -2/5, -2/5, 3/5, 3/5, -1/5, -1/5, -1/5, -1/5, 4/5), ncol = 4)
+contrasts(s_toTest$pathology2_consec) <- matrix(c(-2/3, 1/3, 1/3, -1/3, -1/3, 2/3), ncol = 2)
+
+
+## Change this to be the breakdown of whatever variable the collaborator is interested in
+addmargins(table(s_toTest$FINAL_HX, s_toTest$sample_type, useNA = "ifany")) %>%
+  pander(split.table=Inf)
+```
+
+
+## Differential abundance
+
+Only the taxa with >0.5% mean relative abundance across at least one sample type are tested. The threshold is selected to match the bacteria from Kyle's previous analysis.
+
+```{r}
+props_toTest <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  #filter(mean_prop_max > 0.0035) %>%
+  filter(Taxa != "Bacteria") %>%
+  filter(Taxa != "p__Firmicutes g__Sarcina") %>% ## only one sample with high levels of this bacteria
+  droplevels() %>%
+  
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+
+write.table(props_toTest, file=file.path(data_dir, "props_toTest_BEonly.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+```{r}
+summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type_collapse) %>%
+  summarize(mean_prop = mean(props), perc_presense = mean(props>0)*100) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  filter(Taxa != "p__Firmicutes g__Sarcina") %>% ## only one sample with high levels of this bacteria
+  
+  mutate(mean_prop = mean_prop * 100) %>%
+  mutate(mean_prop_max = mean_prop_max * 100) %>%
+  droplevels() %>%
+  
+  write.table(file=file.path(data_dir, "betrnet_taxa_averages_BEonly.txt"), sep='\t', quote=F, row.names = F)
+```
+
+
+```{r fig.height=15, fig.width=14}
+props_toTest %>%
+  
+  mutate(Taxa = gsub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=sample_type, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+For each sample type: props_log ~ ANTIBIO + FINAL_HX
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of no dysplasia. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + FINAL_HX, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("FINAL_HX", "No dysplasia - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+```{r fig.width=10}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(!grepl("Abx", term)) %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  filter(Taxa %in% taxa_of_interest) %>%
+  filter(!grepl("Abx", term)) %>%
+  mutate(term = sub("No dysplasia - ", "", term)) %>%
+  mutate(term = factor(term, levels(s_toTest$FINAL_HX))) %>%
+  mutate(Taxa = reorder(Taxa, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=Taxa, shape=isSig, color=term)) +
+    geom_vline(xintercept=0, linetype=2) +
+    #geom_point() +
+    geom_pointrange(aes(xmin = estimate - std.error, xmax = estimate + std.error), position = position_dodge(width = 0.25)) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nwith no dysplasia group",
+      y="", shape=""
+    )
+
+```
+
+
+```{r fig.height=3, fig.width=5, eval=F}
+props_toTest %>%
+  filter(Taxa %in% "Firmicutes Lactobacillus") %>%
+  filter(sample_type %in% c("Squamous", "Barrett's")) %>%
+  droplevels() %>%
+  
+  ggplot(aes(x=sample_type, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      #legend.position="bottom",
+      aspect.ratio=0.5
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+ggsave("betrnet_Fig1Ca.pdf", height=2, width=7, useDingbats=F)
+```
+
+
+For each sample type: props_log ~ ANTIBIO + pathology_linear
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The pathology levels are treated as ordered factors and a polynomial is fit across the levels. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+
+```{r fig.height=15, fig.width=10, eval=T}
+#Here is plot for the taxa that show a linear increase across pathology severity.
+
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.15) %>%
+  filter(term == "pathology_linear.L") %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+props_toTest %>%
+  
+  filter(Taxa %in% taxa_of_interest) %>%
+  mutate(Taxa = sub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=FINAL_HX, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    geom_smooth(method="lm", aes(group=1), color="black") +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_grid(Taxa~sample_type, scales="free") +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      strip.text.y = element_text(angle = 0)
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+
+
+
+```
+
+### Fig 1F
+
+```{r fig.height=15, fig.width=10, eval=T}
+#Here is plot for the taxa that show a linear increase across pathology severity.
+
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(term == "pathology_linear.L") %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+props_toTest %>%
+  
+  filter(Taxa %in% taxa_of_interest) %>%
+  mutate(Taxa = sub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  filter(sample_type == "Barrett's") %>%
+  
+  ggplot(aes(x=FINAL_HX_shorthand, color=FINAL_HX_shorthand, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75, size=0.7) +
+    geom_smooth(method="lm", aes(group=1), color="black") +
+    scale_color_manual(values=ann_colors$FINAL_HX_shorthand) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, ncol=2) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      strip.text.y = element_text(angle = 0),
+      aspect.ratio = 1
+    ) +
+    guides(color="none") +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+
+ggsave("betrnet_Fig1F.pdf", height=6.5, width=4, useDingbats=F)
+
+```
+
+
+For each sample type: props_log ~ ANTIBIO + FINAL_HX_consec
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The differences in relative abundances between consecutive time points are estimated. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + FINAL_HX_consec, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+```{r fig.height=5, fig.width=10}
+props_toTest %>%
+  
+  filter(Taxa %in% pull(filter(summaries_df, fdr<0.1), Taxa)) %>%
+  mutate(Taxa = gsub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=sample_type, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+The pathology results are grouped into no dysplasia, intermediate (Indefinite for dysplasia and Low grade dysplasia) and advanced (High grade dysplasia and Adenocarcinoma).
+
+
+```{r fig.height=15, fig.width=14}
+props_toTest %>%
+  
+  mutate(Taxa = gsub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=sample_type, color=pathology2, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology2
+
+Linear models were used to estimate the change in relative abundance of select taxa between higher level pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of no dysplasia. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy_lm_posthoc(lm(props_log ~ ANTIBIO + pathology2, data=.), "pathology2")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Residuals", term)) %>%
+  mutate(term = sub("ANTIBIO", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  
+  select(Taxa, sample_type, term, df, estimate, std.error, p.value, fdr)
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+```{r fig.width=10, fig.height=10}
+
+
+summaries_df %>%
+  #filter(Taxa %in% taxa_of_interest) %>%
+  filter(!grepl("Abx|pathology", term)) %>%
+  #mutate(term = sub("No dysplasia - ", "", term)) %>%
+  #mutate(term = factor(term, levels(s_toTest$pathology2))) %>%
+  mutate(Taxa = reorder(Taxa, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=Taxa, shape=isSig, color=term)) +
+    geom_vline(xintercept=0, linetype=2) +
+    #geom_point() +
+    geom_pointrange(aes(xmin = estimate - std.error, xmax = estimate + std.error), position = position_dodge(width = 0.25)) +
+    #scale_color_manual(values=ann_colors$pathology2) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nbetween groups",
+      y="", shape=""
+    )
+
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology2_linear
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The pathology levels are treated as ordered factors and a polynomial is fit across the levels. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology2_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  #mutate(term = sub("pathology2", "No dysplasia - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+## Differential abundance: ASV level
+
+```{r}
+# find the fusobacteria species that have the highest abundance in BE sampes
+temp <- otu_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("SNV") %>% 
+  pivot_longer(-SNV, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  
+  left_join(rename(a_with_unassigner, SNV=Taxa), by="SNV") %>%
+  filter(sample_type == "Barrett's") %>%
+  filter(grepl("Fusobacterium", tax_assignment)) %>%
+  
+  group_by(SNV, tax_assignment) %>%
+  summarize(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  filter(mean_prop > 0) %>%
+  
+  arrange(-mean_prop)
+
+temp %>%
+  group_by(tax_assignment) %>%
+  summarize(temp = sum(mean_prop)) %>%
+  ungroup() %>%
+  arrange(-temp)
+
+
+
+temp <- otu_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("SNV") %>% 
+  pivot_longer(-SNV, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  
+  left_join(rename(a_with_unassigner, SNV=Taxa), by="SNV") %>%
+  filter(sample_type == "Barrett's") %>%
+  filter(grepl("Fusobacterium", tax_assignment)) %>%
+  
+  group_by(SampleID, tax_assignment) %>%
+  summarize(props = sum(props)) %>%
+  ungroup() %>%
+  
+  group_by(tax_assignment) %>%
+  summarize(temp = mean(props)) %>%
+  ungroup() %>%
+  
+  arrange(-temp)
+```
+
+
+
+Only the taxa with >0.5% mean relative abundance across at least one sample type are tested. The threshold is selected to match the bacteria from Kyle's previous analysis.
+
+```{r}
+props_toTest <- otu_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("SNV") %>% 
+  pivot_longer(-SNV, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(SNV, sample_type) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(SNV) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.001) %>%
+  left_join(rename(a_with_unassigner, SNV=Taxa), by="SNV") %>%
+  filter(!grepl("Sarcina", tax_assignment)) %>%
+  #rename(Name = y) %>%
+  #mutate(Name = gsub("[pcofgs]__", "", Name)) %>%
+  
+  mutate(SNV = str_sub(SNV, 1, 10)) %>% ### if the SNV names don't fit in the plot, you can shorten them for plotting
+  mutate(Taxa = paste(tax_assignment, SNV, sep = ' ')) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+props_toTest %>%
+  select(SNV, tax_assignment, SampleID, props, mean_prop,mean_prop_max, sample_type, study_group_collapse) %>%
+  write.table(file=file.path(data_dir, "snvs_toTest_BEonly.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+## Differential abundance: Bacterial phenotypes
+
+```{r}
+props_toTest <- props_with_phenotypes %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  
+  mutate(phenotype = paste(Phenotype_category, Phenotype, sep='\n')) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(phenotype) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.01) %>%
+  droplevels() %>%
+  
+  
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+
+#write.table(props_toTest, file=file.path(data_dir, "props_toTest_BEsignature.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+
+
+```{r fig.height=8, fig.width=14}
+props_toTest %>%
+  
+  ggplot(aes(x=sample_type, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~phenotype, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+For each sample type: props_log ~ ANTIBIO + FINAL_HX
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of no dysplasia. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + FINAL_HX, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("FINAL_HX", "No dysplasia - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+```{r fig.width=10}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(!grepl("Abx", term)) %>%
+  pull(phenotype) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  #filter(phenotype %in% taxa_of_interest) %>%
+  filter(!grepl("Abx", term)) %>%
+  mutate(term = sub("No dysplasia - ", "", term)) %>%
+  mutate(term = factor(term, levels(s_toTest$FINAL_HX))) %>%
+  mutate(phenotype = reorder(phenotype, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=phenotype, shape=isSig, color=term)) +
+    geom_vline(xintercept=0, linetype=2) +
+    #geom_point() +
+    geom_pointrange(aes(xmin = estimate - std.error, xmax = estimate + std.error), position = position_dodge(width = 0.25)) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nwith no dysplasia group",
+      y="", shape=""
+    )
+
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology_linear
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The pathology levels are treated as ordered factors and a polynomial is fit across the levels. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+
+```{r fig.height=8, fig.width=10, eval=T}
+#Here is plot for the taxa that show a linear increase across pathology severity.
+
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(term == "pathology_linear.L") %>%
+  pull(phenotype) %>%
+  as.character() %>%
+  unique()
+
+props_toTest %>%
+  
+  filter(phenotype %in% taxa_of_interest) %>%
+  
+  ggplot(aes(x=FINAL_HX, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    geom_smooth(method="lm", aes(group=1), color="black") +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_grid(phenotype~sample_type, scales="free") +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      strip.text.y = element_text(angle = 0)
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+
+
+
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + FINAL_HX_consec
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The differences in relative abundances between consecutive time points are estimated. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + FINAL_HX_consec, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+```{r fig.height=5, fig.width=10, eval=T}
+props_toTest %>%
+  
+  filter(phenotype %in% pull(filter(summaries_df, fdr<0.1), phenotype)) %>%
+  
+  ggplot(aes(x=sample_type, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~phenotype, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+The pathology results are grouped into no dysplasia, intermediate (Indefinite for dysplasia and Low grade dysplasia) and advanced (High grade dysplasia and Adenocarcinoma).
+
+
+```{r fig.height=8, fig.width=14}
+props_toTest %>%
+  
+  ggplot(aes(x=sample_type, color=pathology2, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~phenotype, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology2
+
+Linear models were used to estimate the change in relative abundance of select taxa between higher level pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of no dysplasia. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy_lm_posthoc(lm(props_log ~ ANTIBIO + pathology2, data=.), "pathology2")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Residuals", term)) %>%
+  mutate(term = sub("ANTIBIO", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  
+  select(phenotype, sample_type, term, df, estimate, std.error, p.value, fdr)
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+```{r fig.width=10, fig.height=7}
+
+
+summaries_df %>%
+  #filter(Taxa %in% taxa_of_interest) %>%
+  filter(!grepl("Abx|pathology", term)) %>%
+  #mutate(term = sub("No dysplasia - ", "", term)) %>%
+  #mutate(term = factor(term, levels(s_toTest$pathology2))) %>%
+  mutate(phenotype = reorder(phenotype, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=phenotype, shape=isSig, color=term)) +
+    geom_vline(xintercept=0, linetype=2) +
+    #geom_point() +
+    geom_pointrange(aes(xmin = estimate - std.error, xmax = estimate + std.error), position = position_dodge(width = 0.25)) +
+    #scale_color_manual(values=ann_colors$pathology2) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nbetween groups",
+      y="", shape=""
+    )
+
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology2_linear
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The pathology levels are treated as ordered factors and a polynomial is fit across the levels. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology2_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  #mutate(term = sub("pathology2", "No dysplasia - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+
+
+
+
+\newpage
+
+## Beta diversity
+
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(wu) %>%
+  plot(color=FINAL_HX) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="", title="Weighted UniFrac")
+```
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(uu) %>%
+  plot(color=FINAL_HX) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="", title="Unweighted UniFrac")
+```
+
+
+PERMANOVA test on weighted and unweighted UniFrac distances to test if the centroids of the study groups can be distinguished from each other.
+
+```{r}
+summaries_df <- rbind(
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonispost(
+      ., distmat = wu, formula = distmat ~ FINAL_HX, permutations=perm, which = FINAL_HX, alpha = 0.05)) %>%
+    ungroup() %>%
+    mutate(metric = "Weighted UniFrac"),
+  
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonispost(
+      ., distmat = uu, formula = distmat ~ FINAL_HX, permutations=perm, which = FINAL_HX, alpha = 0.05)) %>%
+    ungroup() %>%
+    mutate(metric = "Unweighted UniFrac")
+) %>%
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("term", "sumsq", "meansq"))) %>%
+  select(metric, everything())
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style() %>%
+  column_spec(c(3), width = "10em")
+```
+
+
+
+Dispersion test 
+
+```{r}
+s_toTest %>%
+  group_by(sample_type) %>%
+  do(tidy(anova(betadisper(dist_subset(wu, .$SampleID), .$FINAL_HX)))) %>%
+  ungroup() %>%
+  filter(!grepl("Residuals", term)) %>%
+  kable_style()
+```
+
+
+```{r}
+s_toTest %>%
+  group_by(sample_type) %>%
+  do(TukeyHSD(betadisper(dist_subset(wu, .$SampleID), .$FINAL_HX))$group %>% as_tibble(rownames="contrast")) %>% 
+  ungroup() %>%
+  rename(p.value = "p adj") %>%
+  kable_style()
+  #pander(split.table=Inf, digits=2)
+```
+
+
+The pathology results are grouped into no dysplasia, intermediate (Indefinite for dysplasia and Low grade dysplasia) and advanced (High grade dysplasia and Adenocarcinoma).
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(wu) %>%
+  plot(color=pathology2) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    theme(
+      legend.position = "bottom"
+    ) +
+    labs(color="", shape="", title="Weighted UniFrac")
+```
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(uu) %>%
+  plot(color=pathology2) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    theme(
+      legend.position = "bottom"
+    ) +
+    labs(color="", shape="", title="Unweighted UniFrac")
+```
+
+
+
+
+PERMANOVA test on weighted and unweighted UniFrac distances to test if the centroids of the study groups can be distinguished from each other.
+
+```{r}
+summaries_df <- rbind(
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonispost(
+      ., distmat = wu, formula = distmat ~ ANTIBIO + pathology2, permutations=perm, which = pathology2, alpha = 0.05)) %>%
+    ungroup() %>%
+    mutate(metric = "Weighted UniFrac"),
+  
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonispost(
+      ., distmat = uu, formula = distmat ~ ANTIBIO + pathology2, permutations=perm, which = pathology2, alpha = 0.05)) %>%
+    ungroup() %>%
+    mutate(metric = "Unweighted UniFrac")
+) %>%
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq"))) %>%
+  select(metric, everything())
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style()
+```
+
+
+
+
+Distance between centroids
+
+```{r fig.height=8}
+pairwise_dists <- s_toTest %>%
+  group_by(sample_type) %>%
+  do(dist_groups(dist_subset(wu, .$SampleID), .$pathology2)) %>%
+  ungroup() %>%
+  mutate(Label = factor(Label)) %>%
+  mutate(Label = fct_relevel(Label, "Within Intermediate", after=0)) #%>%
+  #mutate(Label = reorder(Label, -Distance)) %>%
+
+pairwise_dists %>%
+  ggplot(aes(x=Label, y=Distance)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(alpha=0.5) +
+    facet_wrap(~sample_type) +
+    theme_clean() +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+    )
+```
+
+```{r}
+pairwise_dists %>%
+  group_by(sample_type) %>%
+  do(tidy(lm(Distance ~ Label, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("Label", "Within Intermediate - ", term)) %>%
+  kable_style()
+
+```
+
+
+
+
+```{r}
+pairwise_dists %>%
+  filter(Label %in% c("Between No dysplasia and Intermediate", "Between Intermediate and Advanced")) %>%
+  group_by(sample_type) %>%
+  do(tidy(lm(Distance ~ Label, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("Label", "Between Intermediate and Advanced - ", term)) %>%
+  kable_style()
+
+```
+
+
+\newpage
+
+## Alpha diversity
+
+Alpha diversity was assessed by the expected number of observed OTUs (out of rarefying sample size of `r format(richness_subsample_size, big.mark = ",", scientific = F)`), Shannon index, and Faith’s phylogenetic diversity.
+
+```{r fig.width=8, fig.height=8}
+s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  ggplot(aes(x=sample_type, y=alpha, color=FINAL_HX)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(dodge.width=0.75) +
+    facet_grid(metric~., scales = "free") +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    theme_clean() +
+    #guides(color="none") +
+    labs(
+      x="", color="",
+      y="Alpha diversity value"
+    )
+
+```
+
+Linear models were used to estimate the difference between study groups.
+
+For each sample type: alpha ~ ANTIBIO + FINAL_HX
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + FINAL_HX, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("FINAL_HX", "No dysplasia - ", term)) %>% ## Change control to whatever the reference group is
+  mutate(term = sub("ANTIBIOYes", "Abx use", term))
+
+summaries_df %>%
+  kable_style()
+
+```
+
+For each sample type: alpha ~ ANTIBIO + pathology_linear
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + pathology_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term))
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  kable_style()
+
+```
+
+
+
+```{r fig.width=8, fig.height=8}
+s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  ggplot(aes(x=sample_type, y=alpha, color=pathology2)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(dodge.width=0.75) +
+    facet_grid(metric~., scales = "free") +
+    scale_color_manual(values=ann_colors$pathology2) +
+    theme_clean() +
+    #guides(color="none") +
+    labs(
+      x="", color="",
+      y="Alpha diversity value"
+    )
+
+```
+
+
+For each sample type: alpha ~ ANTIBIO + pathology2
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy_lm_posthoc(lm(alpha ~ ANTIBIO + pathology2, data=.), "pathology2")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Residual", term))
+
+summaries_df %>%
+  select(metric, sample_type, term, df, estimate, std.error, p.value) %>%
+  kable_style()
+
+```
+
+For each sample type: alpha ~ ANTIBIO + pathology2_linear
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + pathology2_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term))
+
+summaries_df %>%
+  kable_style()
+
+```
+
+
+# Comparing pathology levels to healthy
+
+The samples that don't have any pathology information. The subjects are `r clinical_data %>% filter(is.na(FINAL_HX)) %>% pull(subject_id) %>% str_c(collapse=", ")`
+
+Only the subjects on PPI are included in this analysis.
+
+```{r}
+## Subset the metadata file to only keep the samples you would like to test on
+s_toTest <- s %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(sample_type %in% c("Cardia brushing", "Barrett's brushing", "Squamous brushing", "Saliva", "Oral wash")) %>%
+  mutate(sample_type_all = sample_type) %>%
+  mutate(sample_type =  fct_collapse(sample_type_all, `Cardia and Barretts` = c("Cardia brushing", "Barrett's brushing"))) %>%
+  mutate(sample_type = fct_recode(sample_type, `Squamous`="Squamous brushing")) %>%
+  mutate(on_ppi = ifelse(on_ppi, "PPI", "no PPI")) %>%
+  mutate(on_ppi = factor(on_ppi)) %>%
+  filter(on_ppi %in% c("PPI")) %>%
+  mutate(study_group_collapse = fct_rev(study_group_collapse)) %>%
+  
+  filter(!is.na(FINAL_HX)) %>%
+  
+  mutate(FINAL_HX = factor(FINAL_HX, levels=c("Control", "Intestinal metaplasia, no dysplasia", "Indefinite for dysplasia", "Low grade dysplasia", "High grade dysplasia", "Adenocarcinoma"))) %>%
+  
+  mutate(pathology_linear = factor(FINAL_HX, ordered=T)) %>%
+  
+  mutate(pathology2 = fct_collapse(FINAL_HX, `No dysplasia`=c("Intestinal metaplasia, no dysplasia"), Intermediate=c("Indefinite for dysplasia", "Low grade dysplasia"), Advanced=c("High grade dysplasia", "Adenocarcinoma"))) %>%
+  mutate(pathology2_linear = factor(pathology2, ordered=T)) %>%
+  
+  select(-FINAL_PATH) %>%
+  
+  droplevels()
+
+## Set colors for each factor ahead of time so they are consistent through the report.
+ann_colors = list(
+  on_ppi = factor_palette(s_toTest$on_ppi, brewer.pal(3, "Set1")),
+  ANTIBIO = factor_palette(s_toTest$ANTIBIO, brewer.pal(3, "Dark2")),
+  study_site = factor_palette(s_toTest$study_site, as.character(wes_palette("Cavalcanti1"))),
+  #study_day = factor_palette(s_toTest$study_day, viridis(length(levels(s_toTest$study_day))) ),
+  study_group_collapse = factor_palette(s_toTest$study_group_collapse, as.character(wes_palette("Royal1"))),
+  FINAL_HX = factor_palette(s_toTest$FINAL_HX, viridis(length(levels(s_toTest$FINAL_HX)), end=0.8) ),
+  pathology2 = factor_palette(s_toTest$pathology2, viridis(length(levels(s_toTest$pathology2)), end=0.8) )
+)
+
+## Change this to be the breakdown of whatever variable the collaborator is interested in
+addmargins(table(s_toTest$study_group_collapse, s_toTest$sample_type_collapse, useNA = "ifany")) %>%
+  pander(split.table=Inf)
+```
+
+
+## Differential abundance
+
+Only the taxa with >0.5% mean relative abundance across at least one sample type are tested. The threshold is selected to match the bacteria from Kyle's previous analysis.
+
+```{r}
+props_toTest <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  filter(Taxa != "p__Firmicutes g__Sarcina") %>% ## only one sample with high levels of this bacteria
+  droplevels() %>%
+  
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+
+#write.table(props_toTest, file=file.path(data_dir, "props_toTest_BEsignature.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+```{r fig.height=15, fig.width=10}
+props_toTest %>%
+  
+  mutate(Taxa = gsub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=sample_type, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, scales="free", ncol=3) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+```{r}
+## Figure for a grant
+props_toTest %>%
+  filter(Taxa %in% "Firmicutes Streptococcus") %>%
+  filter(sample_type %in% "Cardia and Barretts") %>%
+  mutate(FINAL_HX_label = fct_recode(FINAL_HX,
+                                     "non-BE"="Control",
+                                     "ND"="Intestinal metaplasia, no dysplasia",
+                                     "IND"="Indefinite for dysplasia",
+                                     "LGD"="Low grade dysplasia",
+                                     "HGD"="High grade dysplasia",
+                                     "EAC"="Adenocarcinoma")) %>%
+  ggplot(aes(x=FINAL_HX_label, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    #facet_wrap(~Taxa, scales="free", ncol=3) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance of\nStreptococcus")
+ggsave("betrnet_grant_Strep.pdf", height=2, width=3.5, useDingbats=F)
+```
+
+For each sample type: props_log ~ ANTIBIO + FINAL_HX
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of control samples. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + FINAL_HX, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("FINAL_HX", "Healthy - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1) %>%
+  column_spec(c(1:3), width = "6em") %>%
+  column_spec(c(4:8), width = "3em")
+```
+
+
+
+
+```{r fig.width=10, fig.height=8}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(!grepl("Abx", term)) %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  filter(Taxa %in% taxa_of_interest) %>%
+  filter(!grepl("Abx", term)) %>%
+  mutate(term = sub("Healthy - ", "", term)) %>%
+  mutate(term = factor(term, levels(s_toTest$FINAL_HX))) %>%
+  mutate(Taxa = reorder(Taxa, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=Taxa, shape=isSig, color=term)) +
+    geom_vline(xintercept=0, linetype=2) +
+    #geom_point() +
+    geom_pointrange(aes(xmin = estimate - std.error, xmax = estimate + std.error), position = position_dodge(width = 0.6)) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nwith control group",
+      y="", shape=""
+    )
+
+```
+
+
+For each sample type: props_log ~ ANTIBIO + pathology_linear
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The pathology levels are treated as ordered factors and a polynomial is fit across the levels. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+
+```{r fig.height=15, fig.width=10, eval=T}
+#Here is plot for the taxa that show a linear increase across pathology severity.
+
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.15) %>%
+  filter(term == "pathology_linear.L") %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+props_toTest %>%
+  
+  filter(Taxa %in% taxa_of_interest) %>%
+  mutate(Taxa = sub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=FINAL_HX, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    geom_smooth(method="lm", aes(group=1), color="black") +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_grid(Taxa~sample_type, scales="free") +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      strip.text.y = element_text(angle = 0)
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+
+
+
+```
+
+The pathology results are grouped into no dysplasia, intermediate (Indefinite for dysplasia and Low grade dysplasia) and advanced (High grade dysplasia and Adenocarcinoma).
+
+
+```{r fig.height=15, fig.width=14}
+props_toTest %>%
+  
+  mutate(Taxa = gsub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=sample_type, color=pathology2, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology2
+
+Linear models were used to estimate the change in relative abundance of select taxa between higher level pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of no dysplasia. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology2, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("pathology2", "Healthy - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+```{r fig.width=10, fig.height=8}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(!grepl("Abx", term)) %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  filter(Taxa %in% taxa_of_interest) %>%
+  filter(!grepl("Abx", term)) %>%
+  mutate(term = sub("Healthy - ", "", term)) %>%
+  mutate(term = factor(term, levels(s_toTest$pathology2))) %>%
+  mutate(Taxa = reorder(Taxa, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=Taxa, shape=isSig, color=term)) +
+    geom_vline(xintercept=0, linetype=2) +
+    #geom_point() +
+    geom_pointrange(aes(xmin = estimate - std.error, xmax = estimate + std.error), position = position_dodge(width = 0.4)) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nwith control group",
+      y="", shape=""
+    )
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology2_linear
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The pathology levels are treated as ordered factors and a polynomial is fit across the levels. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology2_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  #mutate(term = sub("pathology2", "No dysplasia - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+```{r fig.height=15, fig.width=10, eval=T}
+#Here is plot for the taxa that show a linear increase across pathology severity.
+
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.15) %>%
+  filter(term == "pathology2_linear.L") %>%
+  pull(Taxa) %>%
+  as.character() %>%
+  unique()
+
+props_toTest %>%
+  
+  filter(Taxa %in% taxa_of_interest) %>%
+  mutate(Taxa = sub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=pathology2, color=pathology2, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    geom_smooth(method="lm", aes(group=1), color="black") +
+    scale_color_manual(values=ann_colors$pathology2) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_grid(Taxa~sample_type, scales="free") +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      strip.text.y = element_text(angle = 0)
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+
+
+
+```
+
+
+## Differential abundance: Bacterial phenotypes
+
+```{r}
+props_toTest <- props_with_phenotypes %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  
+  mutate(phenotype = paste(Phenotype_category, Phenotype, sep='\n')) %>%
+  
+  group_by(phenotype, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(phenotype) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.01) %>%
+  droplevels() %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+
+#write.table(props_toTest, file=file.path(data_dir, "props_toTest_BEsignature.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+
+
+```{r fig.height=8, fig.width=15}
+props_toTest %>%
+  
+  ggplot(aes(x=sample_type, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~phenotype, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+For each sample type: props_log ~ ANTIBIO + FINAL_HX
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of control samples. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + FINAL_HX, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("FINAL_HX", "Healthy - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1) %>%
+  column_spec(c(1:3), width = "6em") %>%
+  column_spec(c(4:8), width = "3em")
+```
+
+
+
+
+```{r fig.width=10, fig.height=8}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(!grepl("Abx", term)) %>%
+  pull(phenotype) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  #filter(phenotype %in% taxa_of_interest) %>%
+  filter(!grepl("Abx", term)) %>%
+  mutate(term = sub("Healthy - ", "", term)) %>%
+  mutate(term = factor(term, levels(s_toTest$FINAL_HX))) %>%
+  mutate(phenotype = reorder(phenotype, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=phenotype, shape=isSig, color=term)) +
+    geom_vline(xintercept=0, linetype=2) +
+    #geom_point() +
+    geom_pointrange(aes(xmin = estimate - std.error, xmax = estimate + std.error), position = position_dodge(width = 0.6)) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nwith control group",
+      y="", shape=""
+    )
+
+```
+
+
+For each sample type: props_log ~ ANTIBIO + pathology_linear
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The pathology levels are treated as ordered factors and a polynomial is fit across the levels. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+
+```{r fig.height=15, fig.width=10, eval=T}
+#Here is plot for the taxa that show a linear increase across pathology severity.
+
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.15) %>%
+  filter(term == "pathology_linear.L") %>%
+  pull(phenotype) %>%
+  as.character() %>%
+  unique()
+
+props_toTest %>%
+  
+  filter(phenotype %in% taxa_of_interest) %>%
+  
+  ggplot(aes(x=FINAL_HX, color=FINAL_HX, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    geom_smooth(method="lm", aes(group=1), color="black") +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_grid(phenotype~sample_type, scales="free") +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      strip.text.y = element_text(angle = 0)
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+
+
+
+```
+
+The pathology results are grouped into no dysplasia, intermediate (Indefinite for dysplasia and Low grade dysplasia) and advanced (High grade dysplasia and Adenocarcinoma).
+
+
+```{r fig.height=8, fig.width=14}
+props_toTest %>%
+  
+  ggplot(aes(x=sample_type, color=pathology2, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~phenotype, scales="free", ncol=4) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology2
+
+Linear models were used to estimate the change in relative abundance of select taxa between higher level pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of no dysplasia. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology2, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("pathology2", "Healthy - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+
+```{r fig.width=10, fig.height=8}
+taxa_of_interest <- summaries_df %>%
+  filter(fdr < 0.1) %>%
+  filter(!grepl("Abx", term)) %>%
+  pull(phenotype) %>%
+  as.character() %>%
+  unique()
+
+summaries_df %>%
+  #filter(phenotype %in% taxa_of_interest) %>%
+  filter(!grepl("Abx", term)) %>%
+  mutate(term = sub("Healthy - ", "", term)) %>%
+  mutate(term = factor(term, levels(s_toTest$pathology2))) %>%
+  mutate(phenotype = reorder(phenotype, estimate)) %>%
+  
+  mutate(isSig = ifelse(fdr < 0.1, "q<0.1", "q>0.1")) %>%
+  
+  ggplot(aes(x=estimate, y=phenotype, shape=isSig, color=term)) +
+    geom_vline(xintercept=0, linetype=2) +
+    #geom_point() +
+    geom_pointrange(aes(xmin = estimate - std.error, xmax = estimate + std.error), position = position_dodge(width = 0.4)) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~sample_type, ncol=4) +
+    theme_clean() +
+    labs(
+      x="Estimated mean difference\nwith control group",
+      y="", shape=""
+    )
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + pathology2_linear
+
+Linear models were used to estimate the change in relative abundance of select taxa between pathology groups. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+The pathology levels are treated as ordered factors and a polynomial is fit across the levels. Antibiotics use is added as a covariate.
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(phenotype, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + pathology2_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  #mutate(term = sub("pathology2", "No dysplasia - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+```{r fig.height=15, fig.width=10, eval=T}
+#Here is plot for the taxa that show a linear increase across pathology severity.
+
+taxa_of_interest <- summaries_df %>%
+  #filter(fdr < 0.15) %>%
+  filter(term == "pathology2_linear.L") %>%
+  pull(phenotype) %>%
+  as.character() %>%
+  unique()
+
+props_toTest %>%
+  
+  filter(phenotype %in% taxa_of_interest) %>%
+  
+  ggplot(aes(x=pathology2, color=pathology2, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    geom_smooth(method="lm", aes(group=1), color="black") +
+    scale_color_manual(values=ann_colors$pathology2) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_grid(phenotype~sample_type, scales="free") +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      strip.text.y = element_text(angle = 0)
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+
+
+
+```
+
+
+
+## Beta diversity
+
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(wu) %>%
+  plot(color=FINAL_HX) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="", title="Weighted UniFrac")
+```
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(uu) %>%
+  plot(color=FINAL_HX) +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="", title="Unweighted UniFrac")
+```
+
+
+PERMANOVA test on weighted and unweighted UniFrac distances to test if the centroids of the study groups can be distinguished from each other.
+
+```{r}
+summaries_df <- rbind(
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonispost(
+      ., distmat = wu, formula = distmat ~ FINAL_HX, permutations=perm, which = FINAL_HX, alpha = 0.05)) %>%
+    ungroup() %>%
+    mutate(metric = "Weighted UniFrac"),
+  
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonispost(
+      ., distmat = uu, formula = distmat ~ FINAL_HX, permutations=perm, which = FINAL_HX, alpha = 0.05)) %>%
+    ungroup() %>%
+    mutate(metric = "Unweighted UniFrac")
+) %>%
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("term", "sumsq", "meansq"))) %>%
+  select(metric, everything()) %>%
+  
+  filter(grepl("All|Control", comparison))
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style() %>%
+  column_spec(c(3), width = "10em")
+```
+
+
+
+
+The pathology results are grouped into no dysplasia, intermediate (Indefinite for dysplasia and Low grade dysplasia) and advanced (High grade dysplasia and Adenocarcinoma).
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(wu) %>%
+  plot(color=pathology2) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    theme(
+      legend.position = "bottom"
+    ) +
+    labs(color="", shape="", title="Weighted UniFrac")
+```
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(uu) %>%
+  plot(color=pathology2) +
+    scale_color_manual(values=ann_colors$pathology2) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    theme(
+      legend.position = "bottom"
+    ) +
+    labs(color="", shape="", title="Unweighted UniFrac")
+```
+
+
+
+
+PERMANOVA test on weighted and unweighted UniFrac distances to test if the centroids of the study groups can be distinguished from each other.
+
+```{r}
+summaries_df <- rbind(
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonispost(
+      ., distmat = wu, formula = distmat ~ ANTIBIO + pathology2, permutations=perm, which = pathology2, alpha = 0.05)) %>%
+    ungroup() %>%
+    mutate(metric = "Weighted UniFrac"),
+  
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonispost(
+      ., distmat = uu, formula = distmat ~ ANTIBIO + pathology2, permutations=perm, which = pathology2, alpha = 0.05)) %>%
+    ungroup() %>%
+    mutate(metric = "Unweighted UniFrac")
+) %>%
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq"))) %>%
+  select(metric, everything()) %>%
+  
+  filter(grepl("All|Control", comparison))
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style()
+```
+
+
+## Alpha diversity
+
+Alpha diversity was assessed by the expected number of observed OTUs (out of rarefying sample size of `r format(richness_subsample_size, big.mark = ",", scientific = F)`), Shannon index, and Faith’s phylogenetic diversity.
+
+```{r fig.width=8, fig.height=8}
+s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  ggplot(aes(x=sample_type, y=alpha, color=FINAL_HX)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(dodge.width=0.75) +
+    facet_grid(metric~., scales = "free") +
+    scale_color_manual(values=ann_colors$FINAL_HX) +
+    theme_clean() +
+    #guides(color="none") +
+    labs(
+      x="", color="",
+      y="Alpha diversity value"
+    )
+
+```
+
+Linear models were used to estimate the difference between study groups.
+
+For each sample type: alpha ~ ANTIBIO + FINAL_HX
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + FINAL_HX, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("FINAL_HX", "Control - ", term)) %>% ## Change control to whatever the reference group is
+  mutate(term = sub("ANTIBIOYes", "Abx use", term))
+
+summaries_df %>%
+  kable_style()
+
+```
+
+For each sample type: alpha ~ ANTIBIO + pathology_linear
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + pathology_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term))
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  kable_style()
+
+```
+
+
+
+```{r fig.width=8, fig.height=8}
+s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  ggplot(aes(x=sample_type, y=alpha, color=pathology2)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(dodge.width=0.75) +
+    facet_grid(metric~., scales = "free") +
+    scale_color_manual(values=ann_colors$pathology2) +
+    theme_clean() +
+    #guides(color="none") +
+    labs(
+      x="", color="",
+      y="Alpha diversity value"
+    )
+
+```
+
+
+For each sample type: alpha ~ ANTIBIO + pathology2
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + pathology2, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("pathology2", "Control - ", term)) %>% ## Change control to whatever the reference group is
+  mutate(term = sub("ANTIBIOYes", "Abx use", term))
+
+summaries_df %>%
+  mutate(term = sub("\\^", "", term)) %>%
+  kable_style()
+
+```
+
+
+For each sample type: alpha ~ ANTIBIO + pathology2_linear
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + pathology2_linear, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term))
+
+summaries_df %>%
+  kable_style()
+
+```
+
+
+
+# Comparing the 2 clusters from Yun's analysis
+
+```{r}
+cluster_info <- read_delim(file.path(data_dir, "kmeans(RIN_largerThan5).csv")) %>%
+  filter(cluster %in% c(1,2)) %>%
+  select(subject_id = subjectID, cluster) %>%
+  mutate(cluster = paste("Cluster", cluster)) %>%
+  mutate(cluster = factor(cluster))
+
+
+s_toTest <- s %>%
+  right_join(cluster_info, by="subject_id") %>%
+  
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(study_group_collapse %in% "Barrett's") %>%
+  filter(sample_type %in% c("Cardia brushing", "Barrett's brushing", "Squamous brushing", "Saliva", "Oral wash")) %>%
+  mutate(sample_type_all = sample_type) %>%
+  mutate(sample_type =  fct_collapse(sample_type_all, `Cardia and Barretts` = c("Cardia brushing", "Barrett's brushing"))) %>%
+  mutate(sample_type = fct_recode(sample_type, `Squamous`="Squamous brushing")) %>%
+  droplevels()
+
+## Set colors for each factor ahead of time so they are consistent through the report.
+ann_colors = list(
+  ANTIBIO = factor_palette(s_toTest$ANTIBIO, brewer.pal(3, "Dark2")),
+  cluster = factor_palette(s_toTest$cluster, as.character(wes_palette("Royal1")))
+)
+
+## Change this to be the breakdown of whatever variable the collaborator is interested in
+addmargins(table(s_toTest$cluster, s_toTest$sample_type_collapse, useNA = "ifany")) %>%
+  pander(split.table=Inf)
+```
+
+## Differential abundance
+
+Only the taxa with >0.5% mean relative abundance across at least one sample type are tested. The threshold is selected to match the bacteria from Kyle's previous analysis.
+
+```{r}
+props_toTest <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  filter(Taxa != "p__Firmicutes g__Sarcina") %>% ## only one sample with high levels of this bacteria
+  droplevels() %>%
+  
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+
+
+#write.table(props_toTest, file=file.path(data_dir, "props_toTest_BEsignature.tsv"), sep='\t', row.names=F, quote=F)
+```
+
+
+```{r fig.height=15, fig.width=10}
+props_toTest %>%
+  
+  mutate(Taxa = gsub(" ", "\n", Taxa)) %>%
+  mutate(Taxa = reorder(Taxa, -props)) %>%
+  
+  ggplot(aes(x=sample_type, color=cluster, y=props)) +
+    geom_boxplot(outlier.alpha = 0) +
+    geom_quasirandom(dodge.width = 0.75) +
+    scale_color_manual(values=ann_colors$cluster) +
+    #scale_shape_manual(values=c(16,1)) +
+    facet_wrap(~Taxa, scales="free", ncol=3) +
+    scale_y_continuous(labels=scales:::percent, trans="log10") +
+    theme_clean() +
+    theme(
+      legend.position="bottom"
+    ) +
+    #guides(color=F) +
+    labs(
+      x= "", color="", shape="",
+      y="Relative abundance")
+```
+
+
+
+For each sample type: props_log ~ ANTIBIO + cluster
+
+Linear models were used to estimate the change in relative abundance of select taxa between Yun's clusters. The relative abundances were log10 transformed. Multiple tests were adjusted for false discovery rate using Benjamini-Hochberg method. Only the terms with p<0.05 are shown in the table below.
+
+Each pathology result is compared to the reference group of control samples. Antibiotics use is added as a covariate.
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  filter(mean_prop > 0) %>%
+  
+  group_by(Taxa, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + cluster, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("clusterCluster", "Cluster 1 - ", term)) %>% 
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term, sample_type) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1) %>%
+  column_spec(c(1:3), width = "6em") %>%
+  column_spec(c(4:8), width = "3em")
+```
+
+
+
+
+
+
+
+## Beta diversity
+
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(wu) %>%
+  plot(color=cluster) +
+    scale_color_manual(values=ann_colors$cluster) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="", title="Weighted UniFrac")
+```
+
+```{r fig.width=10}
+s_toTest %>%
+  pcoaplus(uu) %>%
+  plot(color=cluster) +
+    scale_color_manual(values=ann_colors$cluster) +
+    scale_shape_manual(values=c(1,16)) +
+    facet_wrap(~sample_type_collapse, ncol=4) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="", title="Unweighted UniFrac")
+```
+
+
+
+PERMANOVA test on weighted and unweighted UniFrac distances to test if the centroids of the study groups can be distinguished from each other.
+
+```{r}
+summaries_df <- rbind(
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonisplus(
+      ., distmat = wu, formula = distmat ~ ANTIBIO + cluster, permutations=perm)) %>%
+    ungroup() %>%
+    mutate(metric = "Weighted UniFrac"),
+  
+  s_toTest %>%
+    group_by(sample_type) %>%
+    do(adonisplus(
+      ., distmat = uu, formula = distmat ~ ANTIBIO + cluster, permutations=perm)) %>%
+    ungroup() %>%
+    mutate(metric = "Unweighted UniFrac")
+) %>%
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq"))) %>%
+  select(metric, everything()) 
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style() #%>%
+  #column_spec(c(3), width = "10em")
+```
+
+## Alpha diversity
+
+Alpha diversity was assessed by the expected number of observed OTUs (out of rarefying sample size of `r format(richness_subsample_size, big.mark = ",", scientific = F)`), Shannon index, and Faith’s phylogenetic diversity.
+
+```{r fig.width=8, fig.height=8}
+s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  ggplot(aes(x=sample_type, y=alpha, color=cluster)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(dodge.width=0.75) +
+    facet_grid(metric~., scales = "free") +
+    scale_color_manual(values=ann_colors$cluster) +
+    theme_clean() +
+    #guides(color="none") +
+    labs(
+      x="", color="",
+      y="Alpha diversity value"
+    )
+
+```
+
+Linear models were used to estimate the difference between study groups.
+
+For each sample type: alpha ~ ANTIBIO + cluster
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + cluster, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("clusterCluster", "Cluster 1 - ", term)) %>% ## Change control to whatever the reference group is
+  mutate(term = sub("ANTIBIOYes", "Abx use", term))
+
+summaries_df %>%
+  kable_style()
+
+```
+
+
+
+
+# Healthy subjects only (overview figures)
+
+
+```{r}
+## Subset the metadata file to only keep the samples you would like to test on
+s_toTest <- s %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(study_group_collapse == "Healthy") %>%
+  filter(sample_type %in% c("Cardia brushing", "Squamous brushing", "Saliva", "Oral wash")) %>%
+  filter(SampleID != "B2C017OR2.1") %>% ## take out the duplicate with low read counts
+  #mutate(sample_type_collapse =  fct_collapse(sample_type, `Cardia and Barretts` = c("Cardia brushing", "Barrett's brushing"))) %>%
+  mutate(sample_type = fct_recode(sample_type, `Squamous`="Squamous brushing", `Cardia`="Cardia brushing")) %>%
+  mutate(on_ppi = ifelse(on_ppi, "PPI", "no PPI")) %>%
+  mutate(on_ppi = factor(on_ppi)) %>%
+  mutate(study_group_collapse = fct_rev(study_group_collapse)) %>%
+  droplevels()
+
+## Set colors for each factor ahead of time so they are consistent through the report.
+ann_colors = list(
+  on_ppi = factor_palette(s_toTest$on_ppi, brewer.pal(3, "Set1")),
+  ANTIBIO = factor_palette(s_toTest$ANTIBIO, brewer.pal(3, "Dark2")),
+  study_site = factor_palette(s_toTest$study_site, as.character(wes_palette("Cavalcanti1"))),
+  #study_day = factor_palette(s_toTest$study_day, viridis(length(levels(s_toTest$study_day))) ),
+  #sample_type_collapse = factor_palette(s_toTest$sample_type_collapse, as.character(NatParksPalettes::natparks.pals("Saguaro", 6)), 1,2,4,6),
+  sample_type = factor_palette(s_toTest$sample_type, as.character(NatParksPalettes::natparks.pals("Charmonix", 5))),
+  study_group_collapse = factor_palette(s_toTest$study_group_collapse, as.character(wes_palette("Royal1")))
+)
+
+## Change this to be the breakdown of whatever variable the collaborator is interested in
+addmargins(table(s_toTest$study_group_collapse, s_toTest$sample_type_collapse, useNA = "ifany")) %>%
+  pander(split.table=Inf)
+```
+
+## Differential abundance: Genus level
+
+```{r}
+props_toTest <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  droplevels() %>%
+  
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+```
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  group_by(Taxa) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  #do(tidy(lm(props_log ~ ANTIBIO + on_ppi + study_group_collapse, data=.))) %>%
+  do(tidy_lm_posthoc(nlme::lme(props_log ~ sample_type, random=~1|subject_id, data=., na.action=na.omit), "sample_type")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% 
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  group_by(Taxa, sample_type) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + on_ppi, data=.))) %>%
+  #do(tidy_lm_posthoc(nlme::lme(props_log ~ sample_type, random=~1|subject_id, data=., na.action=na.omit), "sample_type")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% 
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+## Differential abundance: Family level
+
+```{r}
+props_toTest <- summed_props_f %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  droplevels() %>%
+  
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+```
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  group_by(Taxa) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  #do(tidy(lm(props_log ~ ANTIBIO + on_ppi + study_group_collapse, data=.))) %>%
+  do(tidy_lm_posthoc(nlme::lme(props_log ~ sample_type, random=~1|subject_id, data=., na.action=na.omit), "sample_type")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% 
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  group_by(Taxa, sample_type) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + on_ppi, data=.))) %>%
+  #do(tidy_lm_posthoc(nlme::lme(props_log ~ sample_type, random=~1|subject_id, data=., na.action=na.omit), "sample_type")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% 
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+```{r}
+summed_props_f %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  
+  group_by(sample_type, Taxa) %>%
+  summarize(props = mean(props)) %>%
+  ungroup() %>%
+  
+  mutate(Taxa2 = fct_lump(Taxa, 8, w=props)) %>% #select(SampleID, Taxa, Taxa2) %>% View
+  
+  group_by(sample_type, Taxa2) %>%
+  summarize(props = sum(props)) %>%
+  ungroup() %>%
+  
+  mutate(Taxa2 = reorder(Taxa2, props)) %>%
+  mutate(Taxa2 = fct_relevel(Taxa2, "Other", after=0)) %>%
+  mutate(Taxa2 = fct_relabel(Taxa2, function(x) sub("p__.* f__", "", x))) %>% 
+  
+  mutate(sample_type = fct_relabel(sample_type, function(x) sub(" brushing", "", x))) %>%
+  
+  ggplot(aes(x=sample_type, y=props, fill=Taxa2)) +
+    geom_bar(stat="identity") +
+    scale_fill_brewer(palette = 'Set1', direction=-1) +
+    scale_y_continuous(limits = c(0,1), expand=c(0,0), labels=scales:::percent) +
+    theme_classic() +
+    theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+    labs(x="", y="Relative abundance", fill="")
+#ggsave("betrnet_Fig1A_barplot_healthy.pdf", height=3, width=4, useDingbats=F)
+```
+
+
+## Differential abundance
+
+```{r}
+props_toTest <- summed_props %>%
+  as.data.frame() %>% 
+  rownames_to_column("Taxa") %>% 
+  pivot_longer(-Taxa, names_to="SampleID", values_to="props") %>%
+  right_join(s_toTest, by="SampleID")  %>%
+  group_by(Taxa, sample_type_collapse) %>%
+  mutate(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  group_by(Taxa) %>%
+  mutate(mean_prop_max = max(mean_prop)) %>%
+  ungroup() %>%
+  
+  filter(mean_prop_max > 0.005) %>%
+  filter(Taxa != "Bacteria") %>%
+  droplevels() %>%
+  
+  mutate(Taxa = gsub("[pcofgs]__", "", Taxa)) %>%
+  
+  mutate(props_original = props) %>%
+  mutate(props = props + min(filter(., props>0)$props) / 10) %>%
+  mutate(props_log = log10(props))
+```
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  group_by(Taxa) %>%
+  #do(tidy_lmer(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(props_logit ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  #do(tidy(lm(props_log ~ ANTIBIO + on_ppi + study_group_collapse, data=.))) %>%
+  do(tidy_lm_posthoc(nlme::lme(props_log ~ sample_type, random=~1|subject_id, data=., na.action=na.omit), "sample_type")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% 
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+
+```{r}
+summaries_df <- props_toTest %>%
+  
+  group_by(Taxa, sample_type) %>%
+  do(tidy(lm(props_log ~ ANTIBIO + on_ppi, data=.))) %>%
+  #do(tidy_lm_posthoc(nlme::lme(props_log ~ sample_type, random=~1|subject_id, data=., na.action=na.omit), "sample_type")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% 
+  mutate(term = sub("on_ppi", "", term)) %>%
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+summaries_df %>%
+  filter(p.value < 0.05) %>%
+  kable_style(fdr, 0.1)
+```
+
+
+## Beta diversity
+
+
+
+### Supp Fig
+
+```{r fig.width=10}
+pcoa_toPlot <- s_toTest %>%
+  pcoaplus(wu) 
+
+centroids <- pcoa_toPlot %>%
+  group_by(sample_type) %>%
+  mutate(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)) %>%
+  ungroup() 
+
+
+pcoa_toPlot %>%
+  plot(color=sample_type) +
+    scale_color_manual(values=ann_colors$sample_type) +
+    #scale_shape_manual(values=c(1,16)) +
+    geom_point(data=centroids, aes(x=Axis.1, y=Axis.2, color=sample_type), shape=8, stroke=1, size=2) +
+    theme_clean_pcoa() + 
+    labs(color="", shape="")
+
+ggsave("betrnet_Fig_Supp_PCoA_healthy.pdf", height=3, width=6, useDingbats=F)
+```
+
+
+
+```{r}
+summaries_df <-s_toTest %>%
+  #group_by(sample_type_collapse) %>%
+  do(adonispost(
+    ., distmat = wu, formula = distmat ~ sample_type, rep_meas_var = subject_id, shuffle = c(sample_type="within"),
+    sample_id_var = SampleID, permutations=999, which = sample_type, alpha = 1)) %>%
+  #ungroup() %>%
+
+  filter(!term %in% c("Residuals", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq")))
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style()
+```
+
+
+
+```{r}
+summaries_df <-s_toTest %>%
+  #group_by(sample_type_collapse) %>%
+  do(adonispost(
+    ., distmat = wu, formula = distmat ~ on_ppi + sample_type, rep_meas_var = subject_id, shuffle = c(sample_type="within", on_ppi="between"),
+    sample_id_var = SampleID, permutations=999, which = sample_type, alpha = 1)) %>%
+  #ungroup() %>%
+
+  filter(!term %in% c("Residual", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq")))
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style()
+```
+
+
+
+
+```{r}
+summaries_df <-s_toTest %>%
+  group_by(sample_type) %>%
+  do(adonisplus(
+    ., distmat = wu, formula = distmat ~ ANTIBIO + on_ppi,
+    sample_id_var = SampleID, permutations=999)) %>%
+  ungroup() %>%
+
+  filter(!term %in% c("Residual", "Total")) %>%
+  select(-one_of(c("sumsq", "meansq")))
+
+
+# If you don't need the shuffling functionality, you can use
+# summaries_df <- adonisplus(s_toTest, wu, distmat ~ study_group)
+
+
+summaries_df %>%
+  kable_style()
+```
+
+
+
+
+## Alpha diversity
+
+Alpha diversity was assessed by the expected number of observed OTUs (out of rarefying sample size of `r format(richness_subsample_size, big.mark = ",", scientific = F)`), Shannon index, and Faith’s phylogenetic diversity.
+
+```{r fig.width=8}
+s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  ggplot(aes(x=sample_type, color=on_ppi, y=alpha)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom(dodge.width=0.75) +
+    facet_grid(metric~., scales = "free") +
+    scale_color_manual(values=ann_colors$on_ppi) +
+    scale_shape_manual(values=c(16,1)) +
+    theme_clean() +
+    #guides(color=F) +
+    labs(
+      x="", color="",
+      y="Alpha diversity value"
+    )
+
+```
+
+
+
+Linear models were used to estimate the difference between study groups.
+
+```{r}
+summaries_df <- s_toTest %>%
+  pivot_longer(c("Richness", "Shannon", "Faith"), names_to="metric", values_to="alpha") %>%
+  mutate(metric = fct_relevel(metric, "Faith", after=Inf)) %>%
+  mutate(metric = fct_recode(metric, `Faith's PD`="Faith")) %>%
+  
+  group_by(metric, sample_type) %>%
+  #do(tidy_lmer(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit))) %>%
+  #do(tidy_lmer2(nlme::lme(alpha ~ study_group, random=~1|subject_id, data=., na.action=na.omit), "study_group")) %>%
+  do(tidy(lm(alpha ~ ANTIBIO + on_ppi, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("study_group_collapse", "Healthy - ", term)) %>% ## Change control to whatever the reference group is
+  mutate(term = sub("ANTIBIOYes", "Abx use", term)) %>%
+  mutate(term = sub("on_ppiPPI", "PPI use", term))
+
+summaries_df %>%
+  kable_style()
+
+```
